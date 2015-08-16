@@ -9,12 +9,16 @@ namespace PointerHook {
 		static void Main(string[] args) {
 			Console.Title = "Pointer Hook Test";
 
-			HackyPointer Ptr = new HackyPointer(sizeof(int));
+			HackyPointer Ptr = new HackyPointer(HackyPointer.PageSize);
+			Console.WriteLine(Ptr);
+
 			int* IPtr = (int*)Ptr;
+			IPtr[0] = 314159;
+			IPtr[1] = 42;
+			Console.WriteLine(IPtr[0]);
+			Console.WriteLine(IPtr[1]);
 
-			Console.WriteLine("Pointer: {0}", Ptr);
-
-
+			Ptr.Dispose();
 			Console.WriteLine("Done!");
 			Console.ReadLine();
 		}
