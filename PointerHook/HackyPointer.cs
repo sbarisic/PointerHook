@@ -20,6 +20,12 @@ namespace PointerHook {
 	}
 
 	[Flags()]
+	public enum FreeType : uint {
+		Decommit = 0x4000,
+		Release = 0x8000,
+	}
+
+	[Flags()]
 	public enum MemProtection : uint {
 		NoAccess = 0x01,
 		ReadOnly = 0x02,
@@ -63,48 +69,51 @@ namespace PointerHook {
 		public uint ExceptionCode;
 		public uint ExceptionFlags;
 		public EXCEPTION_RECORD* ExceptionRecord;
-		public IntPtr ExceptionAddress;
+		public void* ExceptionAddress;
 		public uint NumberParameters;
 		public fixed int ExceptionInformation[15];
+	}
 
-		public uint GetExceptionCode() {
-			return (ExceptionCode << 1) >> 1;
-		}
-
-		public override string ToString() {
-			StringBuilder SB = new StringBuilder();
-			SB.AppendFormat("ExceptionCode: 0x{0:X}\n", ExceptionCode);
-			SB.AppendFormat("ExceptionFlags: 0x{0:X}\n", ExceptionFlags);
-			SB.AppendFormat("ExceptionRecord: 0x{0:X}\n", (int)ExceptionRecord);
-			SB.AppendFormat("ExceptionAddress: 0x{0:X}\n", ExceptionAddress);
-			SB.AppendFormat("NumberParameters: 0x{0:X}\n", NumberParameters);
-			SB.AppendLine("ExceptionInfo:");
-			fixed (int* ExInfo = ExceptionInformation) {
-				IntPtr* Info = (IntPtr*)ExInfo;
-				for (int i = 0; i < 15; i++)
-					SB.AppendFormat(" {0}: 0x{1:X}\n", i, Info[i].ToInt64());
-			}
-			return SB.ToString();
-		}
+	[StructLayout(LayoutKind.Sequential, Pack = 1)]
+	unsafe struct FLOATING_SAVE_AREA_WIN {
+		public uint ControlWord;
+		public uint StatusWord;
+		public uint TagWord;
+		public uint ErrorOffset;
+		public uint ErrorSelector;
+		public uint DataOffset;
+		public uint DataSelector;
+		public fixed byte RegisterArea[80];
+		public uint Cr0NpxState;
 	}
 
 	[StructLayout(LayoutKind.Sequential, Pack = 1)]
 	unsafe struct CONTEXT {
-		public uint R0;
-		public uint R1;
-		public uint R2;
-		public uint R3;
-		public uint R4;
-		public uint R5;
-		public uint R6;
-		public uint R7;
-		public uint R8;
-		public uint R9;
-		public uint R10;
-		public uint R11;
-		public uint R12;
+		public uint ContextFlags;
+		public uint Dr0;
+		public uint Dr1;
+		public uint Dr2;
+		public uint Dr3;
+		public uint Dr6;
+		public uint Dr7;
+		public FLOATING_SAVE_AREA_WIN FloatSave;
+		public uint SegGs;
+		public uint SegFs;
+		public uint SegEs;
+		public uint SegDs;
+		public uint Edi;
+		public uint Esi;
+		public uint Ebx;
+		public uint Edx;
+		public uint Ecx;
+		public uint Eax;
+		public uint Ebp;
+		public uint Eip;
+		public uint SegCs;
+		public uint EFlags;
+		public uint Esp;
+		public uint SegSs;
 	}
-
 
 	[StructLayout(LayoutKind.Sequential, Pack = 1)]
 	unsafe struct EXCEPTION_PTRS {
@@ -128,19 +137,24 @@ namespace PointerHook {
 		public static extern IntPtr VirtualAlloc(IntPtr Addr, uint Size, AllocType AType, MemProtection Protect);
 
 		[DllImport("kernel32", SetLastError = true, CallingConvention = CallingConvention.Winapi)]
+		public static extern bool VirtualFree(IntPtr Addr, uint Size = 0, FreeType FType = FreeType.Release);
+
+		[DllImport("kernel32", SetLastError = true, CallingConvention = CallingConvention.Winapi)]
 		public static extern bool VirtualProtect(IntPtr Addr, uint Size, MemProtection NewProtect, out MemProtection OldProtect);
 
 		[DllImport("kernel32", SetLastError = true, CallingConvention = CallingConvention.Winapi)]
 		public static extern IntPtr AddVectoredExceptionHandler(int First, VectoredHandlerFunc Handler);
 
 		[DllImport("kernel32", SetLastError = true, CallingConvention = CallingConvention.Winapi)]
+		public static extern uint RemoveVectoredExceptionHandler(IntPtr Handler);
+
+		[DllImport("kernel32", SetLastError = true, CallingConvention = CallingConvention.Winapi)]
 		public static extern void RaiseException(uint Code, uint Flags, uint NumOfArgs, int* Args);
 	}
 
-	unsafe class HackyPointer : IDisposable {
-		IntPtr Pointer;
-		uint Size;
+	delegate void PointerAccessFunc(HackyPointer Ptr, bool Write, int ByteIdx);
 
+	unsafe class HackyPointer : IDisposable {
 		static uint PSize;
 		public static uint PageSize {
 			get {
@@ -155,19 +169,26 @@ namespace PointerHook {
 		}
 
 		static HashSet<HackyPointer> HackyPointers;
+		static IntPtr Handler;
+
+		public static void Destroy() {
+			if (Handler != IntPtr.Zero) {
+				Handler = IntPtr.Zero;
+				Native.RemoveVectoredExceptionHandler(Handler);
+			}
+		}
 
 		static HackyPointer() {
 			HackyPointers = new HashSet<HackyPointer>();
-			Native.AddVectoredExceptionHandler(0, (H) => {
+
+			HackyPointer LastPtr = null;
+			Handler = Native.AddVectoredExceptionHandler(0, (H) => {
 				uint Code = H->ExceptionRecord->ExceptionCode;
 				// Breakpoints
 				if (Code == 0x80000003)
 					return VHRet.ContinueSearch;
 
-				Console.WriteLine("Code: 0x{0:X}", Code);
-				//Console.WriteLine(H->ExceptionRecord->ToString());
-
-				HackyPointer Ptr = null;
+				HackyPointer Ptr = LastPtr;
 				bool Write = false;
 				IntPtr* Info = (IntPtr*)H->ExceptionRecord->ExceptionInformation;
 				if (H->ExceptionRecord->NumberParameters >= 2) {
@@ -180,31 +201,39 @@ namespace PointerHook {
 						}
 				}
 
-				/*// Access violation
-				if (Code == 0xC0000005) {
-					Debugger.Break();
-
-					if (Ptr != null)
-						Ptr.VirtualProtect(MemProtection.ReadWrite | MemProtection.PageGuard);
-					return VHRet.ContinueExecution;
-				}*/
+				// Single step
+				if (Code == 0x80000004) {
+					LastPtr = null;
+					if (Ptr.Write)
+						Ptr.OnAccess(Ptr, true, (int)Ptr.Offset);
+					Ptr.VirtualProtect(MemProtection.ReadWrite | MemProtection.PageGuard);
+				}
 
 				// Page guard
-				if (Code == 0x80000001 && H->ExceptionRecord->NumberParameters == 2) {
-					if (Ptr != null) {
-						Ptr.VirtualProtect(MemProtection.ReadWrite);
-						Console.WriteLine("{0} to {1}", Write ? "Write" : "Read", Ptr);
-					}
+				if (Code == 0x80000001 && H->ExceptionRecord->NumberParameters == 2 && Ptr != null) {
+					LastPtr = Ptr;
+					Ptr.Write = Write;
+					Ptr.Offset = (uint)((IntPtr*)H->ExceptionRecord->ExceptionInformation)[1].ToInt64() -
+						(uint)Ptr.Pointer.ToInt64();
+					Ptr.VirtualProtect(MemProtection.ReadWrite);
+					H->ContextRecord->EFlags |= 0x100;
+					if (!Write)
+						Ptr.OnAccess(Ptr, false, (int)Ptr.Offset);
 					return VHRet.ContinueExecution;
 				}
 
 				return VHRet.ContinueSearch;
 			});
 		}
-		
 
-		public HackyPointer(uint Size) {
+		PointerAccessFunc OnAccess;
+		IntPtr Pointer;
+		uint Size, Offset;
+		bool Write;
+
+		public HackyPointer(uint Size, PointerAccessFunc OnAccess) {
 			this.Size = Size;
+			this.OnAccess = OnAccess;
 			Pointer = Native.VirtualAlloc(IntPtr.Zero, Size, AllocType.Commit | AllocType.Reserve, MemProtection.ReadWrite);
 			if (Pointer == IntPtr.Zero)
 				throw new Exception("OH NO! IT'S NULL!");
@@ -215,6 +244,7 @@ namespace PointerHook {
 
 		public void Dispose() {
 			HackyPointers.Remove(this);
+			Native.VirtualFree(Pointer);
 		}
 
 		public MemProtection VirtualProtect(MemProtection P) {

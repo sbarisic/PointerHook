@@ -11,16 +11,27 @@ namespace PointerHook {
 		static void Main(string[] args) {
 			Console.Title = "Pointer Hook Test";
 
-			HackyPointer Ptr = new HackyPointer(HackyPointer.PageSize);
-			Console.WriteLine(Ptr);
+			HackyPointer Ptr = new HackyPointer(HackyPointer.PageSize, (P, Write, ByteIdx) => {
+				if (!Write)
+					return;
 
-			int* IPtr = (int*)Ptr;
-			IPtr[2] = 0x42;
+				byte* BPtr = (byte*)P;
+				Console.Write((char)BPtr[ByteIdx]);
+				Console.Write((char)BPtr[ByteIdx + 1]);
+				Console.Write((char)BPtr[ByteIdx + 2]);
+				Console.Write((char)BPtr[ByteIdx + 3]);
+			});
 
-			Debugger.Break();
+
+			byte[] Bytes = Encoding.ASCII.GetBytes("Hello World!\n");
+			Marshal.Copy(Bytes, 0, (IntPtr)Ptr, Bytes.Length);
+
+
 			Ptr.Dispose();
-			Console.WriteLine("Done!");
+			HackyPointer.Destroy();
+			Console.WriteLine("\nDone!");
 			Console.ReadLine();
+			Environment.Exit(0);
 		}
 	}
 }
