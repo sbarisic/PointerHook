@@ -5,6 +5,7 @@ using System.Text;
 using System.Threading.Tasks;
 using System.Runtime.InteropServices;
 using System.Runtime.ExceptionServices;
+using System.Diagnostics;
 
 namespace PointerHook {
 	[Flags()]
@@ -61,30 +62,79 @@ namespace PointerHook {
 	unsafe struct EXCEPTION_RECORD {
 		public uint ExceptionCode;
 		public uint ExceptionFlags;
-		public IntPtr ExceptionRecord;
+		public EXCEPTION_RECORD* ExceptionRecord;
 		public IntPtr ExceptionAddress;
 		public uint NumberParameters;
-		public fixed uint ExceptionInformation[15];
+		public fixed int ExceptionInformation[15];
+
+		public uint GetExceptionCode() {
+			return (ExceptionCode << 1) >> 1;
+		}
+
+		public override string ToString() {
+			StringBuilder SB = new StringBuilder();
+			SB.AppendFormat("ExceptionCode: 0x{0:X}\n", ExceptionCode);
+			SB.AppendFormat("ExceptionFlags: 0x{0:X}\n", ExceptionFlags);
+			SB.AppendFormat("ExceptionRecord: 0x{0:X}\n", (int)ExceptionRecord);
+			SB.AppendFormat("ExceptionAddress: 0x{0:X}\n", ExceptionAddress);
+			SB.AppendFormat("NumberParameters: 0x{0:X}\n", NumberParameters);
+			SB.AppendLine("ExceptionInfo:");
+			fixed (int* ExInfo = ExceptionInformation) {
+				IntPtr* Info = (IntPtr*)ExInfo;
+				for (int i = 0; i < 15; i++)
+					SB.AppendFormat(" {0}: 0x{1:X}\n", i, Info[i].ToInt64());
+			}
+			return SB.ToString();
+		}
 	}
+
+	[StructLayout(LayoutKind.Sequential, Pack = 1)]
+	unsafe struct CONTEXT {
+		public uint R0;
+		public uint R1;
+		public uint R2;
+		public uint R3;
+		public uint R4;
+		public uint R5;
+		public uint R6;
+		public uint R7;
+		public uint R8;
+		public uint R9;
+		public uint R10;
+		public uint R11;
+		public uint R12;
+	}
+
 
 	[StructLayout(LayoutKind.Sequential, Pack = 1)]
 	unsafe struct EXCEPTION_PTRS {
 		public EXCEPTION_RECORD* ExceptionRecord;
-		public IntPtr ContextRecord;
+		public CONTEXT* ContextRecord;
+	}
+
+	enum VHRet : uint {
+		ContinueSearch = 0x0,
+		ContinueExecution = 0xffffffff,
 	}
 
 	[UnmanagedFunctionPointer(CallingConvention.StdCall)]
-	unsafe delegate long VectoredHandlerFunc(EXCEPTION_PTRS* Ptrs);
+	unsafe delegate VHRet VectoredHandlerFunc(EXCEPTION_PTRS* Ptrs);
 
 	static unsafe class Native {
-		[DllImport("kernel32", SetLastError = true)]
+		[DllImport("kernel32", SetLastError = true, CallingConvention = CallingConvention.Winapi)]
 		public static extern void GetSystemInfo(out SysInfo lpSystemInfo);
 
-		[DllImport("kernel32.dll", SetLastError = true)]
+		[DllImport("kernel32", SetLastError = true, CallingConvention = CallingConvention.Winapi)]
 		public static extern IntPtr VirtualAlloc(IntPtr Addr, uint Size, AllocType AType, MemProtection Protect);
 
-		[DllImport("kernel32.dll", SetLastError = true)]
+		[DllImport("kernel32", SetLastError = true, CallingConvention = CallingConvention.Winapi)]
 		public static extern bool VirtualProtect(IntPtr Addr, uint Size, MemProtection NewProtect, out MemProtection OldProtect);
+
+		[DllImport("kernel32", SetLastError = true, CallingConvention = CallingConvention.Winapi)]
+		public static extern IntPtr AddVectoredExceptionHandler(int First, VectoredHandlerFunc Handler);
+
+		[DllImport("kernel32", SetLastError = true, CallingConvention = CallingConvention.Winapi)]
+		public static extern void RaiseException(uint Code, uint Flags, uint NumOfArgs, int* Args);
 	}
 
 	unsafe class HackyPointer : IDisposable {
@@ -108,26 +158,58 @@ namespace PointerHook {
 
 		static HackyPointer() {
 			HackyPointers = new HashSet<HackyPointer>();
+			Native.AddVectoredExceptionHandler(0, (H) => {
+				uint Code = H->ExceptionRecord->ExceptionCode;
+				// Breakpoints
+				if (Code == 0x80000003)
+					return VHRet.ContinueSearch;
 
-			AppDomain.CurrentDomain.UnhandledException += (S, E) => {
-				if (E.ExceptionObject is SEHException) {
-					SEHException SE = E.ExceptionObject as SEHException;
+				Console.WriteLine("Code: 0x{0:X}", Code);
+				//Console.WriteLine(H->ExceptionRecord->ToString());
 
-					int Code = Marshal.GetExceptionCode();
-					EXCEPTION_PTRS* EPtrs = (EXCEPTION_PTRS*)Marshal.GetExceptionPointers().ToPointer();
-
-					Console.WriteLine("Code: {0}", Code);
+				HackyPointer Ptr = null;
+				bool Write = false;
+				IntPtr* Info = (IntPtr*)H->ExceptionRecord->ExceptionInformation;
+				if (H->ExceptionRecord->NumberParameters >= 2) {
+					IntPtr Addr = Info[1];
+					foreach (var HP in HackyPointers)
+						if (HP.Pointer.ToInt64() <= Addr.ToInt64() && (HP.Pointer.ToInt64() + HP.Size) > Addr.ToInt64()) {
+							Ptr = HP;
+							Write = ((IntPtr*)H->ExceptionRecord->ExceptionInformation)[0].ToInt32() == 1;
+							break;
+						}
 				}
-			};
+
+				/*// Access violation
+				if (Code == 0xC0000005) {
+					Debugger.Break();
+
+					if (Ptr != null)
+						Ptr.VirtualProtect(MemProtection.ReadWrite | MemProtection.PageGuard);
+					return VHRet.ContinueExecution;
+				}*/
+
+				// Page guard
+				if (Code == 0x80000001 && H->ExceptionRecord->NumberParameters == 2) {
+					if (Ptr != null) {
+						Ptr.VirtualProtect(MemProtection.ReadWrite);
+						Console.WriteLine("{0} to {1}", Write ? "Write" : "Read", Ptr);
+					}
+					return VHRet.ContinueExecution;
+				}
+
+				return VHRet.ContinueSearch;
+			});
 		}
+		
 
 		public HackyPointer(uint Size) {
 			this.Size = Size;
-			Pointer = Native.VirtualAlloc(IntPtr.Zero, Size, AllocType.Reserve | AllocType.Commit,
-				MemProtection.ReadOnly | MemProtection.PageGuard);
+			Pointer = Native.VirtualAlloc(IntPtr.Zero, Size, AllocType.Commit | AllocType.Reserve, MemProtection.ReadWrite);
 			if (Pointer == IntPtr.Zero)
 				throw new Exception("OH NO! IT'S NULL!");
 
+			VirtualProtect(MemProtection.ReadWrite | MemProtection.PageGuard);
 			HackyPointers.Add(this);
 		}
 
@@ -135,16 +217,15 @@ namespace PointerHook {
 			HackyPointers.Remove(this);
 		}
 
-		void OnException(object Sender, UnhandledExceptionEventArgs E) {
-			if (E.ExceptionObject is SEHException) {
-				SEHException SEH = E.ExceptionObject as SEHException;
-
-				Console.WriteLine(SEH);
-			}
+		public MemProtection VirtualProtect(MemProtection P) {
+			MemProtection Old;
+			if (!Native.VirtualProtect(Pointer, Size, P, out Old))
+				throw new Exception();
+			return Old;
 		}
 
 		public override string ToString() {
-			return string.Format("(@ {0}, Len {1})", Pointer, Size);
+			return string.Format("(0x{0:X}, Len {1})", Pointer.ToInt64(), Size);
 		}
 
 		public static implicit operator void*(HackyPointer Ptr) {

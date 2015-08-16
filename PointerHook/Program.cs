@@ -3,6 +3,8 @@ using System.Collections.Generic;
 using System.Linq;
 using System.Text;
 using System.Threading.Tasks;
+using System.Diagnostics;
+using System.Runtime.InteropServices;
 
 namespace PointerHook {
 	unsafe class Program {
@@ -13,11 +15,9 @@ namespace PointerHook {
 			Console.WriteLine(Ptr);
 
 			int* IPtr = (int*)Ptr;
-			IPtr[0] = 314159;
-			IPtr[1] = 42;
-			Console.WriteLine(IPtr[0]);
-			Console.WriteLine(IPtr[1]);
+			IPtr[2] = 0x42;
 
+			Debugger.Break();
 			Ptr.Dispose();
 			Console.WriteLine("Done!");
 			Console.ReadLine();
