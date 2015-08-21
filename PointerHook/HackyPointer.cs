@@ -173,8 +173,8 @@ namespace PointerHook {
 
 		public static void Destroy() {
 			if (Handler != IntPtr.Zero) {
-				Handler = IntPtr.Zero;
 				Native.RemoveVectoredExceptionHandler(Handler);
+				Handler = IntPtr.Zero;
 			}
 		}
 
